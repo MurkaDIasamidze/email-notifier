@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"fmt"
 	"log"
 	"net/mail"
+	"strconv"
 	"strings"
 	"time"
 
@@ -135,8 +137,8 @@ func checkEmail(account EmailAccount) {
 
 	if account.Protocol == "IMAP" {
 		checkIMAP(account)
-	} else {
-		log.Printf("POP3 not fully implemented in this version")
+	} else if account.Protocol == "POP3" {
+		checkPOP3(account)
 	}
 
 	account.LastCheck = time.Now()
@@ -232,4 +234,126 @@ func parseAddress(addr string) string {
 		return strings.TrimSpace(addr)
 	}
 	return address.String()
+}
+
+func checkPOP3(account EmailAccount) {
+	conn, err := tls.Dial("tcp", fmt.Sprintf("%s:%d", account.Host, account.Port), 
+		&tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		log.Printf("Failed to connect to POP3 server for %s: %v", account.Email, err)
+		return
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	
+	// Read welcome message
+	_, err = reader.ReadString('\n')
+	if err != nil {
+		log.Printf("Failed to read welcome for %s: %v", account.Email, err)
+		return
+	}
+
+	// USER command
+	fmt.Fprintf(conn, "USER %s\r\n", account.Email)
+	response, _ := reader.ReadString('\n')
+	if !strings.HasPrefix(response, "+OK") {
+		log.Printf("POP3 USER failed for %s: %s", account.Email, response)
+		return
+	}
+
+	// PASS command
+	fmt.Fprintf(conn, "PASS %s\r\n", account.Password)
+	response, _ = reader.ReadString('\n')
+	if !strings.HasPrefix(response, "+OK") {
+		log.Printf("POP3 PASS failed for %s: %s", account.Email, response)
+		return
+	}
+
+	// STAT command
+	fmt.Fprintf(conn, "STAT\r\n")
+	response, _ = reader.ReadString('\n')
+	if !strings.HasPrefix(response, "+OK") {
+		log.Printf("POP3 STAT failed for %s: %s", account.Email, response)
+		return
+	}
+
+	parts := strings.Fields(response)
+	if len(parts) < 2 {
+		return
+	}
+	
+	count, err := strconv.Atoi(parts[1])
+	if err != nil || count == 0 {
+		return
+	}
+
+	// Check last 10 messages or all if less than 10
+	start := 1
+	if count > 10 {
+		start = count - 9
+	}
+
+	for i := start; i <= count; i++ {
+		// TOP command to get headers only
+		fmt.Fprintf(conn, "TOP %d 0\r\n", i)
+		response, _ = reader.ReadString('\n')
+		if !strings.HasPrefix(response, "+OK") {
+			continue
+		}
+
+		// Read message headers until "."
+		var headers strings.Builder
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil || line == ".\r\n" || line == ".\n" {
+				break
+			}
+			headers.WriteString(line)
+		}
+
+		emailMsg, err := mail.ReadMessage(strings.NewReader(headers.String()))
+		if err != nil {
+			log.Printf("Failed to parse message %d for %s: %v", i, account.Email, err)
+			continue
+		}
+
+		subject := emailMsg.Header.Get("Subject")
+		from := emailMsg.Header.Get("From")
+		messageID := emailMsg.Header.Get("Message-ID")
+		dateStr := emailMsg.Header.Get("Date")
+
+		if messageID == "" {
+			messageID = fmt.Sprintf("pop3-%s-%d-%d", account.Email, i, time.Now().Unix())
+		}
+
+		receivedAt := time.Now()
+		if dateStr != "" {
+			if parsedDate, err := mail.ParseDate(dateStr); err == nil {
+				receivedAt = parsedDate
+			}
+		}
+
+		var existing EmailNotification
+		result := db.Where("message_id = ?", messageID).First(&existing)
+		
+		if result.Error == gorm.ErrRecordNotFound {
+			notification := EmailNotification{
+				AccountEmail: account.Email,
+				From:         from,
+				Subject:      subject,
+				MessageID:    messageID,
+				ReceivedAt:   receivedAt,
+			}
+			
+			if err := db.Create(&notification).Error; err != nil {
+				log.Printf("Failed to save notification: %v", err)
+			} else {
+				log.Printf("New email: %s - %s", from, subject)
+			}
+		}
+	}
+
+	// QUIT command
+	fmt.Fprintf(conn, "QUIT\r\n")
 }
