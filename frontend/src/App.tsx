@@ -80,6 +80,27 @@ export default function EmailNotifier() {
     }
   };
 
+  const testNotification = () => {
+    if (notificationPermission === 'granted') {
+      new Notification('Test Notification', {
+        body: 'Desktop notifications are working correctly!',
+        icon: '/mail-icon.png',
+      });
+    } else if (notificationPermission === 'default') {
+      Notification.requestPermission().then(permission => {
+        setNotificationPermission(permission);
+        if (permission === 'granted') {
+          new Notification('Test Notification', {
+            body: 'Desktop notifications are now enabled!',
+            icon: '/mail-icon.png',
+          });
+        }
+      });
+    } else {
+      alert('Notifications are blocked. Please enable them in your browser settings.');
+    }
+  };
+
   useEffect(() => {
     if ('Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission().then(permission => {
@@ -180,6 +201,13 @@ export default function EmailNotifier() {
                   <span className="text-sm">Notifications disabled</span>
                 </div>
               )}
+              <button
+                onClick={testNotification}
+                className="ml-4 bg-purple-600 text-white px-4 py-2 rounded-lg hover:bg-purple-700 transition text-sm flex items-center gap-2"
+              >
+                <Bell className="w-4 h-4" />
+                Test Notification
+              </button>
             </div>
           </div>
         </header>
