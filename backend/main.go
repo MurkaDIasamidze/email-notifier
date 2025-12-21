@@ -3,15 +3,19 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/mail"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/websocket/v2"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"gorm.io/driver/postgres"
@@ -41,11 +45,38 @@ type EmailNotification struct {
 	CreatedAt    time.Time `json:"createdAt"`
 }
 
-var db *gorm.DB
+type WSMessage struct {
+	Type    string              `json:"type"`
+	Payload json.RawMessage     `json:"payload,omitempty"`
+	Notif   *EmailNotification  `json:"notification,omitempty"`
+}
+
+var (
+	db            *gorm.DB
+	wsClients     = make(map[*websocket.Conn]bool)
+	wsClientsMux  sync.RWMutex
+	checkInterval time.Duration
+)
 
 func main() {
-	var err error
-	dsn := "host=localhost port=5432 user=postgres password=root dbname=postgres sslmode=disable"
+	// Load environment variables
+	dbHost := getEnv("DB_HOST", "localhost")
+	dbPort := getEnv("DB_PORT", "5432")
+	dbUser := getEnv("DB_USER", "postgres")
+	dbPassword := getEnv("DB_PASSWORD", "root")
+	dbName := getEnv("DB_NAME", "postgres")
+	serverPort := getEnv("SERVER_PORT", "8081")
+	checkIntervalStr := getEnv("CHECK_INTERVAL", "10")
+	
+	checkIntervalInt, err := strconv.Atoi(checkIntervalStr)
+	if err != nil {
+		checkIntervalInt = 10
+	}
+	checkInterval = time.Duration(checkIntervalInt) * time.Second
+
+	// Connect to database
+	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		dbHost, dbPort, dbUser, dbPassword, dbName)
 	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
 		log.Fatal("Failed to connect to database:", err)
@@ -53,23 +84,100 @@ func main() {
 
 	db.AutoMigrate(&EmailAccount{}, &EmailNotification{})
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+	})
 	
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
+		AllowOrigins: getEnv("CORS_ORIGINS", "*"),
 		AllowHeaders: "Origin, Content-Type, Accept",
 	}))
 
+	// REST API endpoints
 	app.Get("/api/accounts", getAccounts)
 	app.Post("/api/accounts", createAccount)
 	app.Put("/api/accounts/:id", updateAccount)
 	app.Delete("/api/accounts/:id", deleteAccount)
 	app.Get("/api/notifications", getNotifications)
 
+	// WebSocket endpoint
+	app.Use("/ws", func(c *fiber.Ctx) error {
+		if websocket.IsWebSocketUpgrade(c) {
+			c.Locals("allowed", true)
+			return c.Next()
+		}
+		return fiber.ErrUpgradeRequired
+	})
+	
+	app.Get("/ws", websocket.New(func(c *websocket.Conn) {
+		wsClientsMux.Lock()
+		wsClients[c] = true
+		wsClientsMux.Unlock()
+
+		defer func() {
+			wsClientsMux.Lock()
+			delete(wsClients, c)
+			wsClientsMux.Unlock()
+			c.Close()
+		}()
+
+		// Send initial data
+		sendInitialData(c)
+
+		// Keep connection alive and handle incoming messages
+		for {
+			_, _, err := c.ReadMessage()
+			if err != nil {
+				log.Println("WebSocket read error:", err)
+				break
+			}
+		}
+	}))
+
+	// Start email check worker
 	go emailCheckWorker()
 
-	log.Println("Server starting on :8081")
-	log.Fatal(app.Listen(":8081"))
+	log.Printf("Server starting on :%s", serverPort)
+	log.Fatal(app.Listen(":" + serverPort))
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func sendInitialData(c *websocket.Conn) {
+	var accounts []EmailAccount
+	db.Find(&accounts)
+	
+	accountsJSON, _ := json.Marshal(accounts)
+	c.WriteJSON(WSMessage{
+		Type:    "accounts",
+		Payload: accountsJSON,
+	})
+
+	var notifications []EmailNotification
+	db.Order("received_at DESC").Limit(50).Find(&notifications)
+	
+	notifsJSON, _ := json.Marshal(notifications)
+	c.WriteJSON(WSMessage{
+		Type:    "notifications",
+		Payload: notifsJSON,
+	})
+}
+
+func broadcastToClients(msg WSMessage) {
+	wsClientsMux.RLock()
+	defer wsClientsMux.RUnlock()
+
+	for client := range wsClients {
+		if err := client.WriteJSON(msg); err != nil {
+			log.Printf("WebSocket write error: %v", err)
+		}
+	}
 }
 
 func getAccounts(c *fiber.Ctx) error {
@@ -84,7 +192,19 @@ func createAccount(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
 	}
 	
-	db.Create(account)
+	if err := db.Create(account).Error; err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Broadcast update via WebSocket
+	var accounts []EmailAccount
+	db.Find(&accounts)
+	accountsJSON, _ := json.Marshal(accounts)
+	broadcastToClients(WSMessage{
+		Type:    "accounts",
+		Payload: accountsJSON,
+	})
+
 	return c.JSON(account)
 }
 
@@ -100,13 +220,38 @@ func updateAccount(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
 	}
 	
-	db.Save(account)
+	if err := db.Save(account).Error; err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Broadcast update via WebSocket
+	var accounts []EmailAccount
+	db.Find(&accounts)
+	accountsJSON, _ := json.Marshal(accounts)
+	broadcastToClients(WSMessage{
+		Type:    "accounts",
+		Payload: accountsJSON,
+	})
+
 	return c.JSON(account)
 }
 
 func deleteAccount(c *fiber.Ctx) error {
 	id := c.Params("id")
-	db.Delete(&EmailAccount{}, id)
+	
+	if err := db.Delete(&EmailAccount{}, id).Error; err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Broadcast update via WebSocket
+	var accounts []EmailAccount
+	db.Find(&accounts)
+	accountsJSON, _ := json.Marshal(accounts)
+	broadcastToClients(WSMessage{
+		Type:    "accounts",
+		Payload: accountsJSON,
+	})
+
 	return c.JSON(fiber.Map{"success": true})
 }
 
@@ -119,7 +264,7 @@ func getNotifications(c *fiber.Ctx) error {
 }
 
 func emailCheckWorker() {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -219,6 +364,11 @@ func checkIMAP(account EmailAccount) {
 				log.Printf("Failed to save notification: %v", err)
 			} else {
 				log.Printf("New email: %s - %s", fromAddr, subject)
+				// Broadcast new notification via WebSocket
+				broadcastToClients(WSMessage{
+					Type:  "new_notification",
+					Notif: &notification,
+				})
 			}
 		}
 	}
@@ -226,14 +376,6 @@ func checkIMAP(account EmailAccount) {
 	if err := <-done; err != nil {
 		log.Printf("Fetch error for %s: %v", account.Email, err)
 	}
-}
-
-func parseAddress(addr string) string {
-	address, err := mail.ParseAddress(addr)
-	if err != nil {
-		return strings.TrimSpace(addr)
-	}
-	return address.String()
 }
 
 func checkPOP3(account EmailAccount) {
@@ -247,14 +389,12 @@ func checkPOP3(account EmailAccount) {
 
 	reader := bufio.NewReader(conn)
 	
-	// Read welcome message
 	_, err = reader.ReadString('\n')
 	if err != nil {
 		log.Printf("Failed to read welcome for %s: %v", account.Email, err)
 		return
 	}
 
-	// USER command
 	fmt.Fprintf(conn, "USER %s\r\n", account.Email)
 	response, _ := reader.ReadString('\n')
 	if !strings.HasPrefix(response, "+OK") {
@@ -262,7 +402,6 @@ func checkPOP3(account EmailAccount) {
 		return
 	}
 
-	// PASS command
 	fmt.Fprintf(conn, "PASS %s\r\n", account.Password)
 	response, _ = reader.ReadString('\n')
 	if !strings.HasPrefix(response, "+OK") {
@@ -270,7 +409,6 @@ func checkPOP3(account EmailAccount) {
 		return
 	}
 
-	// STAT command
 	fmt.Fprintf(conn, "STAT\r\n")
 	response, _ = reader.ReadString('\n')
 	if !strings.HasPrefix(response, "+OK") {
@@ -288,21 +426,18 @@ func checkPOP3(account EmailAccount) {
 		return
 	}
 
-	// Check last 10 messages or all if less than 10
 	start := 1
 	if count > 10 {
 		start = count - 9
 	}
 
 	for i := start; i <= count; i++ {
-		// TOP command to get headers only
 		fmt.Fprintf(conn, "TOP %d 0\r\n", i)
 		response, _ = reader.ReadString('\n')
 		if !strings.HasPrefix(response, "+OK") {
 			continue
 		}
 
-		// Read message headers until "."
 		var headers strings.Builder
 		for {
 			line, err := reader.ReadString('\n')
@@ -350,10 +485,14 @@ func checkPOP3(account EmailAccount) {
 				log.Printf("Failed to save notification: %v", err)
 			} else {
 				log.Printf("New email: %s - %s", from, subject)
+				// Broadcast new notification via WebSocket
+				broadcastToClients(WSMessage{
+					Type:  "new_notification",
+					Notif: &notification,
+				})
 			}
 		}
 	}
 
-	// QUIT command
 	fmt.Fprintf(conn, "QUIT\r\n")
 }
